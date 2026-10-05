@@ -1,0 +1,239 @@
+# .github/workflows/youtube-pipeline.yml
+#
+# GitHub Actions stopgap for the YouTube automation engine.
+# Runs the twice-daily pipeline (09:00 and 16:00 IST) on free GitHub-hosted
+# runners while the Oracle Cloud Always Free VM is still being provisioned.
+#
+# Free-tier math: the repo is PUBLIC, so GitHub-hosted Linux runner minutes are
+# unlimited and free. (On a private repo the allowance would be ~2,000
+# min/month: 2 runs/day x ~20-40 min/run x 30 days ~= 1,200-2,400 min/month —
+# too tight. Keep this repo public.)
+#
+# Source layout: this repo holds the workflow + docs. The pipeline source
+# itself ships as a tarball on OCI Object Storage (SRC_TARBALL_URL below),
+# downloaded by the "Fetch pipeline source" step. To update the code, rebuild
+# and re-upload the tarball with
+#   goals/youtube-automation-engine/hidden_files/github-push/upload_src.py
+# and, if the PAR URL changed, update SRC_TARBALL_URL here.
+#
+# The heartbeat step pushes a timestamp commit (needs contents: write).
+# Secrets come from Settings > Secrets and variables > Actions
+# (see .github/SECRETS.md).
+
+name: YouTube Pipeline (stopgap)
+
+on:
+  schedule:
+    # 09:00 IST = 03:30 UTC, 16:00 IST = 10:30 UTC
+    - cron: '30 3 * * *'
+    - cron: '30 10 * * *'
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Optional topic override (skips trend discovery)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run only (validate environment, generate nothing)'
+        required: false
+        default: 'false'
+
+# Never run two pipeline instances against the same channel state at once.
+concurrency:
+  group: youtube-pipeline
+  cancel-in-progress: false
+
+# The heartbeat step at the end pushes a timestamp commit, which needs this.
+permissions:
+  contents: write
+
+env:
+  SRC_TARBALL_URL: https://axvd5ecuyt5x.objectstorage.ap-hyderabad-1.oci.customer-oci.com/p/KUbz-ztUzCDoS6W6oEOZIAatd0kuXE0zZVBn5tCSI5fsk5pVvOo88TLuWSyQ8AgV/n/axvd5ecuyt5x/b/youtube-automation-src/o/youtube-automation/src-latest.tar.gz
+  NODE_ENV: production
+  LOG_LEVEL: info
+  # Non-secret pipeline tuning (override via repository Variables if wanted)
+  VIDEO_LENGTH: medium
+  DEFAULT_PRIVACY_STATUS: private
+  PUBLISH_DELAY_MINUTES: 0
+  TRENDS_GEO: IN
+  NICHE: tech
+  TTS_PROVIDER: edge
+  # Secrets are mapped to env only where the pipeline reads process.env.
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+  CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+  PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+  PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+  AMAZON_AFFILIATE_TAG: ${{ secrets.AMAZON_AFFILIATE_TAG }}
+  AFFILIATE_LINKS: ${{ secrets.AFFILIATE_LINKS }}
+  COMPETITOR_CHANNELS: ${{ secrets.COMPETITOR_CHANNELS }}
+  DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+  NOTIFICATION_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+jobs:
+  pipeline:
+    name: Generate and publish video
+    runs-on: ubuntu-latest
+    timeout-minutes: 240  # hard cap well above the pipeline's own 3h run timeout
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch pipeline source
+        # The pipeline source ships as a tarball (kept off-repo so code
+        # updates never need a git push). PAR expires 2027-10-05 — regenerate
+        # via hidden_files/github-push/upload_src.py if downloads start failing.
+        run: |
+          curl -sSL "$SRC_TARBALL_URL" -o /tmp/src.tar.gz
+          tar xzf /tmp/src.tar.gz -C "$GITHUB_WORKSPACE"
+          rm /tmp/src.tar.gz
+          test -f package.json && test -f run-pipeline.js && echo "source OK"
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Install Node dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Python deps (faster-whisper, edge-tts)
+        id: pydeps
+        continue-on-error: true
+        run: |
+          pip install -q faster-whisper edge-tts
+          python -c "import faster_whisper; print('faster-whisper OK')"
+          edge-tts --version 2>/dev/null || python -m edge_tts --version 2>/dev/null || echo "edge-tts installed"
+
+      - name: Restore pipeline state cache
+        # data/*.db holds topic dedupe + run history. Runners are ephemeral,
+        # so the state is cached between runs; the key includes run_id so each
+        # run saves a fresh snapshot, restore-keys picks up the latest.
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: pipeline-state-${{ github.run_id }}
+          restore-keys: |
+            pipeline-state-
+
+      - name: Restore YouTube OAuth files from secrets
+        # One-time local OAuth (npm run walkthrough) produces config/tokens.json.
+        # Store its base64 in the YOUTUBE_TOKENS_JSON secret; it is decoded here.
+        # Without it, the job falls back to a dry run (see "Decide run mode").
+        run: |
+          mkdir -p config
+          if [ -n "${{ secrets.YOUTUBE_TOKENS_JSON }}" ]; then
+            echo "${{ secrets.YOUTUBE_TOKENS_JSON }}" | base64 -d > config/tokens.json
+            chmod 600 config/tokens.json
+            echo "tokens.json restored"
+          fi
+          if [ -n "${{ secrets.YOUTUBE_CLIENT_SECRETS_JSON }}" ]; then
+            echo "${{ secrets.YOUTUBE_CLIENT_SECRETS_JSON }}" | base64 -d > config/client_secrets.json
+            chmod 600 config/client_secrets.json
+            echo "client_secrets.json restored"
+          fi
+
+      - name: Decide run mode
+        id: mode
+        run: |
+          HAS_LLM=false
+          for v in OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY; do
+            if [ -n "${!v}" ]; then HAS_LLM=true; fi
+          done
+          if [ -f config/tokens.json ]; then
+            HAS_YT=true
+          else
+            HAS_YT=false
+          fi
+          # NOTE: config/client_secrets.json alone is NOT enough for uploads —
+          # it carries no refresh token, so it only ever qualifies for dry-run.
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "mode=dry" >> "$GITHUB_OUTPUT"
+          elif [ "$HAS_LLM" = true ] && [ "$HAS_YT" = true ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=dry" >> "$GITHUB_OUTPUT"
+            echo "::notice::Missing LLM key or YouTube OAuth secrets — running dry-run validation instead of a full generation."
+          fi
+
+      - name: Dry run (environment validation)
+        if: steps.mode.outputs.mode == 'dry'
+        run: npm run pipeline:dry-run
+
+      - name: Full pipeline run
+        if: steps.mode.outputs.mode == 'full'
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.topic }}" ]; then
+            ARGS="$ARGS --topic \"${{ github.event.inputs.topic }}\""
+          fi
+          eval npm run pipeline -- $ARGS
+
+      - name: Collect generated videos
+        if: always()
+        run: |
+          mkdir -p /tmp/video-artifacts
+          # Grab the newest rendered mp4s from wherever the pipeline left them.
+          find . -path ./node_modules -prune -o -type f -name '*.mp4' -print0 \
+            | xargs -0 -r ls -t 2>/dev/null \
+            | head -5 \
+            | while read -r f; do cp "$f" /tmp/video-artifacts/ 2>/dev/null || true; done
+          ls -la /tmp/video-artifacts/ || true
+
+      - name: Upload videos as workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-videos-${{ github.run_id }}
+          path: /tmp/video-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload pipeline logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Discord notify — success
+        if: success() && env.DISCORD_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"content\": \"✅ YouTube pipeline run succeeded (${{ github.run_id }}). Videos: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+
+      - name: Discord notify — failure
+        if: failure() && env.DISCORD_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"content\": \"❌ YouTube pipeline run FAILED (${{ github.run_id }}). Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+
+      - name: Heartbeat commit (keeps scheduled runs alive)
+        # GitHub auto-disables scheduled workflows after 60 days of repo
+        # inactivity. This tiny commit each run counts as activity, so the
+        # twice-daily schedule never silently stops. [skip ci] is belt-and-
+        # braces: push is not a trigger for this workflow anyway.
+        if: always()
+        run: |
+          mkdir -p state
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > state/heartbeat.txt
+          echo "run ${{ github.run_id }} mode ${{ steps.mode.outputs.mode }}" >> state/heartbeat.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/heartbeat.txt
+          git diff --cached --quiet || git commit -m "chore: pipeline heartbeat [skip ci]"
+          git push || echo "heartbeat push failed (non-fatal)"
